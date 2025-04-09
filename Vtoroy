@@ -1,3 +1,4 @@
+//Библотеки 6 шт.
 #include <DHT.h>                   
 #include <Adafruit_GFX.h>         
 #include <Adafruit_ST7735.h>      
