@@ -1,151 +1,254 @@
-//Библотеки 6 шт.
-#include <DHT.h>                   
-#include <Adafruit_GFX.h>         
-#include <Adafruit_ST7735.h>      
-#include <Wire.h>                 
-#include <CG_RadSens.h>           
-#include <RTClib.h> // Для часов реального времени
-
-#define DHTPIN 2                  
-#define DHTTYPE DHT11             
-DHT dht(DHTPIN, DHTTYPE);         
-
+#include <DHT.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7735.h>
+#include <Wire.h>
+#include <CG_RadSens.h>
+#include <RTClib.h>
+ 
+// --- Конфигурация датчиков и пинов ---
+#define DHTPIN 2
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+ 
 Adafruit_ST7735 tft = Adafruit_ST7735(10, 8, 9);
-#define RADSENS_ADDRESS 0x66      
-CG_RadSens rad(RADSENS_ADDRESS);  
-
-RTC_DS3231 rtc; // Объект для работы с DS3231
-
-#define BUZZER_PIN 3              
-#define LED_PIN 4                 
-
-uint32_t lastPulseCount = 0;  
-int graphX = 0;  
-float lastRadIntensity = 0;  
-unsigned long lastTime = 0;  
-float totalDose = 0;  
-
+#define RADSENS_ADDRESS 0x66
+CG_RadSens rad(RADSENS_ADDRESS);
+ 
+RTC_DS3231 rtc;
+ 
+#define BUZZER_PIN 3
+#define LED_PIN 4
+ 
+// --- Переменные ---
+uint32_t lastPulseCount = 0;
+float lastRadIntensity = 0;
+unsigned long lastUpdateTime = 0;
+unsigned long lastDoseTime = 0;
+unsigned long lastGraphUpdate = 0;
+float totalDose = 0;
+ 
+#define UPDATE_INTERVAL 1000      // Интервал обновления текста (мс)
+#define GRAPH_UPDATE_INTERVAL 2000 // Интервал обновления графика (мс)
+#define DOSE_INTERVAL 3000        // Интервал расчёта дозы (мс)
+ 
+#define GRAPH_HEIGHT 40
+#define GRAPH_Y_START 110         // График
+#define GRAPH_POINTS 115          // Уместить метки (128 - 15)
+float graphData[GRAPH_POINTS] = {0};  // Массив для графика
+ 
+// --- Инициализация ---
 void setup() {
-    dht.begin();
     Serial.begin(9600);
-    Wire.begin(); // Запуск I2C
-    rtc.begin(); // Инициализация часов
-
-    if (rtc.lostPower()) {
-        rtc.adjust(DateTime(F(DATE), F(TIME))); // Установка времени из компиляции
+    Wire.begin();
+    
+    dht.begin();
+ 
+    if (!rtc.begin()) {
+        Serial.println("Ошибка: RTC не найден!");
+        tft.initR(INITR_BLACKTAB);
+        tft.fillScreen(ST77XX_BLACK);
+        tft.setTextColor(ST77XX_RED);
+        tft.setCursor(0, 0);
+        tft.print("RTC Error!");
+        while (1);
     }
-
+    if (rtc.lostPower()) {
+        Serial.println("RTC потерял питание, устанавливаем время.");
+        rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+    }
+ 
     tft.initR(INITR_BLACKTAB);
     tft.fillScreen(ST77XX_BLACK);
     tft.setTextColor(ST77XX_WHITE);
     tft.setTextSize(1);
-
+ 
+    if (!rad.init()) {
+        Serial.println("RadSens не найден!");
+        tft.fillScreen(ST77XX_BLACK);
+        tft.setTextColor(ST77XX_RED);
+        tft.setCursor(0, 0);
+        tft.print("RadSens Error!");
+        while (1);
+    }
+    rad.setSensitivity(105); // Калибровка для SBM-20
+    Serial.print("Chip ID: 0x"); Serial.println(rad.getChipId(), HEX);
+    Serial.print("Firmware version: "); Serial.println(rad.getFirmwareVersion());
+    Serial.print("Sensitivity set to: "); Serial.println(rad.getSensitivity());
+    Serial.println("RadSens подключён.");
+ 
     pinMode(BUZZER_PIN, OUTPUT);
     pinMode(LED_PIN, OUTPUT);
     digitalWrite(LED_PIN, LOW);
-
+ 
     tft.setCursor(0, 0);
     tft.print("Hello");
     delay(2000);
     tft.fillScreen(ST77XX_BLACK);
-
-    if (!rad.init()) {
-        Serial.println("RadSens не найден!");
-        while (1);
-    }
-
-    Serial.println("RadSens подключён.");
-    lastTime = millis();
+ 
+    // Отрисовка осей и подписи графика
+    drawGraphAxes();
+ 
+    lastUpdateTime = millis();
+    lastDoseTime = millis();
+    lastGraphUpdate = millis();
 }
-
-void loop() {
-    float temperature = dht.readTemperature();
-    float humidity = dht.readHumidity();
-
+ 
+// --- Отрисовка осей и подписи графика (один раз) ---
+void drawGraphAxes() {
+    // Очистка области графика
+    tft.fillRect(0, GRAPH_Y_START, tft.width(), GRAPH_HEIGHT, ST77XX_BLACK);
+ 
+    // Подпись над графиком
+    tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+    tft.setTextSize(1);
+    tft.setCursor(0, GRAPH_Y_START - 15); // y=95
+    tft.print("Rad Graph (mcR/h)");
+ 
+    // Отрисовка осей
+    tft.drawFastHLine(0, GRAPH_Y_START + GRAPH_HEIGHT, tft.width(), ST77XX_WHITE); // X-ось
+    tft.drawFastVLine(0, GRAPH_Y_START + 5, GRAPH_HEIGHT - 10, ST77XX_WHITE); // Y-ось короче
+ 
+    // Метки на Y-оси (0, 50, 100 мкР/ч)
+    tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+    tft.setTextSize(1);
+    tft.setCursor(0, GRAPH_Y_START + GRAPH_HEIGHT - 5); tft.print("0");
+    tft.setCursor(0, GRAPH_Y_START + GRAPH_HEIGHT / 2 - 5); tft.print("50");
+    tft.setCursor(0, GRAPH_Y_START + 6 - 5); tft.print("100"); // Смещена вниз
+}
+ 
+// --- Чтение данных с датчиков ---
+bool readSensors(float &temperature, float &humidity, float &radIntensity, uint32_t &pulseCount) {
+    temperature = dht.readTemperature();
+    humidity = dht.readHumidity();
+    radIntensity = rad.getRadIntensyDynamic();
+    pulseCount = rad.getNumberOfPulses();
+ 
     if (isnan(temperature) || isnan(humidity)) {
         Serial.println("Ошибка DHT11!");
-        return;
+        return false;
     }
-
-    float radIntensityDynamic = rad.getRadIntensyDynamic();
-    uint32_t pulseCount = rad.getNumberOfPulses();
-
-    if (radIntensityDynamic == 0) {
-        radIntensityDynamic = lastRadIntensity;
+ 
+    if (radIntensity == 0) {
+        radIntensity = lastRadIntensity;
+        if (lastRadIntensity == 0) {
+            Serial.println("RadSens: нет данных!");
+        }
     } else {
-        lastRadIntensity = radIntensityDynamic;
+        lastRadIntensity = radIntensity;
     }
-
+ 
+    return true;
+}
+ 
+// --- Обновление дозы ---
+void updateDose(float radIntensity) {
     unsigned long currentTime = millis();
-    if (currentTime - lastTime >= 3000) {
-        float timeElapsedInHours = 3000.0 / 3600000.0;
-        totalDose += radIntensityDynamic * timeElapsedInHours;
-        lastTime = currentTime;
+    if (currentTime - lastDoseTime >= DOSE_INTERVAL) {
+        float timeElapsedInHours = (currentTime - lastDoseTime) / 3600000.0;
+        totalDose += radIntensity * timeElapsedInHours;
+        lastDoseTime = currentTime;
     }
-
-    if (pulseCount > lastPulseCount) { 
+}
+ 
+// --- Управление индикаторами ---
+void updateIndicators(float radIntensity, uint32_t pulseCount) {
+    if (pulseCount > lastPulseCount) {
         digitalWrite(LED_PIN, HIGH);
         delay(50);
         digitalWrite(LED_PIN, LOW);
         lastPulseCount = pulseCount;
     }
-
-    if (radIntensityDynamic > 30) {
-        tone(BUZZER_PIN, 1000);
+ 
+    if (radIntensity > 30) {
+        tone(BUZZER_PIN, 1000, 100);
     } else {
         noTone(BUZZER_PIN);
     }
-
-    Serial.print("Темп: "); Serial.print(temperature); Serial.println(" C");
-    Serial.print("Влажн: "); Serial.print(humidity); Serial.println(" %");
-    Serial.print("Рад: "); Serial.print(radIntensityDynamic); Serial.println(" мкР/ч");
-    Serial.print("Импульсы: "); Serial.println(pulseCount);
-    Serial.print("Dose for 3 seconds: "); Serial.println(totalDose);
-
-    // Отображение времени вверху
-    DateTime now = rtc.now();
+}
+ 
+// --- Обновление дисплея (уменьшенные интервалы) ---
+void updateDisplay(float temperature, float humidity, float radIntensity, uint32_t pulseCount, float dose, DateTime now) {
     tft.setCursor(0, 0);
-    tft.fillRect(0, 0, tft.width(), 10, ST77XX_BLACK);
-    tft.setTextColor(ST77XX_GREEN);
+    tft.setTextColor(ST77XX_GREEN, ST77XX_BLACK);
     if (now.hour() < 10) tft.print("0");
-    tft.print(now.hour());
-    tft.print(":");
+    tft.print(now.hour()); tft.print(":");
     if (now.minute() < 10) tft.print("0");
-    tft.print(now.minute());
-    tft.print(":");
+    tft.print(now.minute()); tft.print(":");
     if (now.second() < 10) tft.print("0");
     tft.print(now.second());
-
-    // Остальной вывод
-    tft.setCursor(0, 20);
-    tft.fillRect(0, 20, tft.width(), 10, ST77XX_BLACK);
-    tft.setTextColor(ST77XX_YELLOW);
-    tft.print("Temp: "); tft.print(temperature); tft.println(" C");
-
-    tft.setCursor(0, 40);
-    tft.fillRect(0, 40, tft.width(), 10, ST77XX_BLACK);
-    tft.setTextColor(ST77XX_CYAN);
-    tft.print("Humidity: "); tft.print(humidity); tft.println(" %");
-
+ 
+    tft.setCursor(0, 15);
+    tft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK);
+    tft.print("Temp: "); tft.print(temperature); tft.print(" C ");
+ 
+    tft.setCursor(0, 30);
+    tft.setTextColor(ST77XX_CYAN, ST77XX_BLACK);
+    tft.print("Humidity: "); tft.print(humidity); tft.print(" % ");
+ 
+    tft.setCursor(0, 45);
+    tft.setTextColor(ST77XX_RED, ST77XX_BLACK);
+    if (radIntensity == 0 && lastRadIntensity == 0) {
+        tft.print("Rad: No Signal   ");
+    } else {
+        tft.print("Rad: "); tft.print(radIntensity); tft.print(" mcR/h ");
+    }
+ 
     tft.setCursor(0, 60);
-    tft.fillRect(0, 60, tft.width(), 10, ST77XX_BLACK);
-    tft.setTextColor(ST77XX_RED);
-    tft.print("Rad: "); tft.print(radIntensityDynamic); tft.println(" mcR/h");
-
-    tft.setCursor(0, 80);
-    tft.fillRect(0, 80, tft.width(), 10, ST77XX_BLACK);
-    tft.setTextColor(ST77XX_WHITE);
-    tft.print("Pulses: "); tft.print(pulseCount);
-tft.setCursor(0, 100);
-    tft.fillRect(0, 100, tft.width(), 10, ST77XX_BLACK);
-    tft.setTextColor(ST77XX_MAGENTA);
-    tft.print("Total Dose: "); tft.print(totalDose); tft.println(" mcR");
-
-    graphX = (graphX + 1) % tft.width();
-    int radValue = map(radIntensityDynamic, 0, 100, tft.height() - 20, 0);
-    radValue = constrain(radValue, 0, tft.height() - 20);
-    tft.drawLine(graphX - 1, radValue, graphX, tft.height() - 20 - map(radIntensityDynamic, 0, 100, 0, 40), ST77XX_GREEN);
-    tft.drawLine(0, tft.height() - 20, tft.width(), tft.height() - 20, ST77XX_WHITE);
-
-    delay(1000); // Теперь обновляем каждую секунду
+    tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+    tft.print("Pulses: "); tft.print(pulseCount); tft.print("   ");
+ 
+    tft.setCursor(0, 75);
+    tft.setTextColor(ST77XX_MAGENTA, ST77XX_BLACK);
+    tft.print("Total Dose: "); tft.print(dose); tft.print(" mcR ");
+}
+ 
+// --- Обновление графика (столбчатый, метки статичны) ---
+void updateGraph(float radIntensity) {
+    // Сдвиг данных
+    for (int i = 0; i < GRAPH_POINTS - 1; i++) {
+        graphData[i] = graphData[i + 1];
+    }
+    graphData[GRAPH_POINTS - 1] = radIntensity;
+ 
+    // Очистка области столбцов, исключая Y-ось и метки
+    tft.fillRect(15, GRAPH_Y_START, tft.width() - 15, GRAPH_HEIGHT, ST77XX_BLACK);
+ 
+    // Отрисовка столбцов со смещением
+    for (int x = 0; x < GRAPH_POINTS; x++) {
+        int barHeight = map(graphData[x], 0, 100, 0, GRAPH_HEIGHT);
+        if (barHeight > 0) {
+            tft.fillRect(x + 15, GRAPH_Y_START + GRAPH_HEIGHT - barHeight, 1, barHeight, ST77XX_GREEN);
+        }
+    }
+}
+ 
+// --- Основной цикл ---
+void loop() {
+    unsigned long currentTime = millis();
+ 
+    if (currentTime - lastUpdateTime >= UPDATE_INTERVAL) {
+        float temperature, humidity, radIntensity;
+        uint32_t pulseCount;
+ 
+        if (readSensors(temperature, humidity, radIntensity, pulseCount)) {
+            updateDose(radIntensity);
+            updateIndicators(radIntensity, pulseCount);
+ 
+            Serial.print("Темп: "); Serial.print(temperature); Serial.println(" C");
+            Serial.print("Влажн: "); Serial.print(humidity); Serial.println(" %");
+            Serial.print("Рад: "); Serial.print(radIntensity); Serial.println(" мкР/ч");
+            Serial.print("Импульсы: "); Serial.println(pulseCount);
+            Serial.print("Доза: "); Serial.println(totalDose);
+ 
+            DateTime now = rtc.now();
+            updateDisplay(temperature, humidity, radIntensity, pulseCount, totalDose, now);
+ 
+            if (currentTime - lastGraphUpdate >= GRAPH_UPDATE_INTERVAL) {
+                updateGraph(radIntensity);
+                lastGraphUpdate = currentTime;
+            }
+        }
+ 
+        lastUpdateTime = currentTime;
+    }
 }
